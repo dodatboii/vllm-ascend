@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
@@ -11,6 +12,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_prefix_cacheable,
 )
 
 
@@ -50,3 +52,40 @@ def test_sliding_window_mla_storage_and_page_size():
     )
     assert spec.storage_block_size == 16
     assert spec.real_page_size_bytes == 16 * 128 * 2
+
+
+def _swa_spec(bounded_replay=False, sliding_window=64):
+    return AscendSlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        bounded_replay=bounded_replay,
+    )
+
+
+class TestSWABoundedReplaySpec:
+    """Bounded-replay spec semantics ported from upstream #56227."""
+
+    def test_default_is_prefix_cacheable_without_replay(self):
+        spec = _swa_spec()
+        assert spec.prefix_cacheable
+        assert spec.prefix_replay_tokens == 0
+        assert is_prefix_cacheable(spec)
+
+    def test_bounded_replay_opts_out_of_prefix_caching(self):
+        spec = _swa_spec(bounded_replay=True, sliding_window=128)
+        assert not spec.prefix_cacheable
+        assert spec.prefix_replay_tokens == 128
+        assert not is_prefix_cacheable(spec)
+
+    def test_merge_propagates_bounded_replay(self):
+        merged = AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=True)])
+        assert merged.bounded_replay
+        assert not merged.prefix_cacheable
+        assert merged.prefix_replay_tokens == 64
+
+    def test_merge_rejects_mixed_replay_policy(self):
+        with pytest.raises(AssertionError, match="replay policy"):
+            AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=False)])

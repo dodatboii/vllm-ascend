@@ -341,6 +341,7 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "swa_bounded_replay": true,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -485,6 +486,15 @@ class AscendConfig:
     )
     dump_config_path: str | None = None
     mc2_comm_alg: Literal["", "fullmesh", "hierarchy", "fullmesh_v2"] = ""
+    # DeepSeek-V4.1 FLash SWA bounded replay: keep the
+    # sliding-window KV out of prefix caching and rebuild it after a prefix
+    # hit by recomputing the hit's last window. The pinned vLLM CacheConfig
+    # has no such field; derive_and_validate injects it as
+    # cache_config.swa_bounded_replay so every consumer reads the same place
+    # upstream reads it. Models/environments without SWA replay support never
+    # consume it; unsupported combinations are downgraded to False with a
+    # warning where the bounded_replay spec is built (model wiring).
+    swa_bounded_replay: bool = True
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
@@ -817,6 +827,15 @@ class AscendConfig:
 
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
+
+        # Publish the SWA bounded replay switch onto cache_config so the model
+        # spec, scheduler and worker read it from the same place upstream
+        # reads it. The pinned CacheConfig has no such dataclass field;
+        # inject the attribute instead of patching the upstream dataclass/CLI.
+        # compute_hash only iterates declared fields, so the injected
+        # attribute is excluded from the hash — matching upstream, which lists
+        # the toggle among those not impacting compiled graph shapes.
+        vc.cache_config.swa_bounded_replay = self.swa_bounded_replay
         return self
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:

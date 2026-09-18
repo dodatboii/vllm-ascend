@@ -255,9 +255,21 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     compress_ratio: int = 1
     model_version: str | None = None
     indexes_kv_by_block_stride: bool = False
+    # DeepSeek-V4.1 Flash only: keep the sliding-window
+    # cache out of prefix caching and rebuild it after a prefix hit by
+    # replaying the hit's last window.
+    bounded_replay: bool = False
 
     def __post_init__(self):
         pass
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return not self.bounded_replay
+
+    @property
+    def prefix_replay_tokens(self) -> int:
+        return self.sliding_window if self.bounded_replay else 0
 
     @property
     def storage_block_size(self) -> int:
@@ -276,15 +288,17 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
+        bounded_replay_set = set(spec.bounded_replay for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
+            and len(bounded_replay_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version and sliding "
-            "window size."
+            "quantization method, compress ratio, model version, sliding "
+            "window size and replay policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -296,6 +310,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            bounded_replay=bounded_replay_set.pop(),
         )
 
 

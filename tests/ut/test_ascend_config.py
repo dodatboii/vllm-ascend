@@ -222,6 +222,25 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.rl_config.enabled)
 
     @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_swa_bounded_replay_injected_into_cache_config_by_default(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertTrue(ascend_config.swa_bounded_replay)
+        # The pinned CacheConfig has no such dataclass field; init injects the
+        # attribute so consumers read the same place upstream #56227 reads it.
+        self.assertTrue(test_vllm_config.cache_config.swa_bounded_replay)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_swa_bounded_replay_disabled_via_additional_config(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"swa_bounded_replay": False}
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertFalse(ascend_config.swa_bounded_replay)
+        self.assertFalse(test_vllm_config.cache_config.swa_bounded_replay)
+
+    @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_warns_unsupported_prefill_backend(self, mock_fix_incompatible_config, mock_logger):
