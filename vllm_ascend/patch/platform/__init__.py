@@ -22,6 +22,7 @@ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
 import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
+import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
 import vllm_ascend.patch.platform.patch_use_v2_model_runner  # noqa
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -99,3 +100,34 @@ import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
 #    Future Plan:
 #       Remove this patch when upstream supports per-group or backend-defined
 #       prefill boundaries.
+#
+# ** File: platform/patch_swa_bounded_replay.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.request.Request` (replay_start attribute)
+#   2. `vllm.v1.core.sched.output.NewRequestData`
+#   3. `vllm.v1.core.sched.output.CachedRequestData`
+#   4. `vllm.v1.core.kv_cache_manager.KVCacheManager.allocate_slots`
+#   5. `vllm.v1.core.single_type_kv_cache_manager.SingleTypeKVCacheManager.cache_blocks`
+#    Why:
+#       DeepSeek-V4.1 Flash SWA bounded replay: the sliding-window KV group
+#       opts out of prefix caching and is rebuilt after a prefix hit by
+#       recomputing the hit's last window. The scheduler rewinds the computed
+#       count, so the model runner has to be told where the replay starts, a
+#       chunk that ends inside the replayed range has to be able to allocate
+#       no slots while still adopting the hit, and a non-cacheable group must
+#       never publish its blocks to the prefix cache.
+#    How:
+#       Declare the per-request `replay_start` on the scheduler output payloads
+#       (the pinned `Request`/`NewRequestData` lack the field and the release
+#       lane lacks the whole API), relax the `allocate_slots` guard, and skip
+#       `cache_blocks` for a non-cacheable group. `CachedRequestData` is
+#       Ascend-only: the V1 runner resumes a preempted request through it
+#       where the V2 runner folds resumed requests into the new-request list.
+#    Related PR (if no, explain why):
+#       https://github.com/vllm-project/vllm/pull/56227 (open, not merged)
+#       https://github.com/vllm-project/vllm/pull/56752 (decoder side)
+#    Future Plan:
+#       Remove this patch once #56227 is merged and the pin is bumped; the
+#       Ascend-only `CachedRequestData.replay_start` has to be contributed
+#       upstream or kept until the pinned V1 runner is retired.
+#

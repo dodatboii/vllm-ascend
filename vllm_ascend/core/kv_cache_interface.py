@@ -67,6 +67,18 @@ def is_prefix_cacheable(kv_cache_spec: KVCacheSpec) -> bool:
     return getattr(kv_cache_spec, "prefix_cacheable", True)
 
 
+def get_prefix_replay_tokens(kv_cache_spec: KVCacheSpec) -> int:
+    """Resolve the bounded-replay window through uniform wrappers.
+
+    Only a replaying spec reports a non-zero window; every other spec, and
+    every lane without the API at all, reports zero. A uniform group reports
+    the window its specs agree on, matching upstream's ``max`` over the group.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        return max(get_prefix_replay_tokens(spec) for spec in kv_cache_spec.kv_cache_specs.values())
+    return getattr(kv_cache_spec, "prefix_replay_tokens", 0)
+
+
 def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
     """Whether state caches advance by a padded page size shared with attention.
 

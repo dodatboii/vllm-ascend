@@ -53,6 +53,7 @@ from vllm_ascend.utils import (
     refresh_block_size,
     update_cudagraph_capture_sizes,
     enable_sp,
+    vllm_version_is,
 )
 
 if TYPE_CHECKING:
@@ -1286,6 +1287,93 @@ def _setup_worker_and_scheduler(
                 "vllm_ascend.core.batch_job_aware_scheduler.BatchJobAwareScheduler"
             )
 
+    _apply_swa_bounded_replay(vllm_config, ascend_config)
+
+
+def _swa_bounded_replay_scheduler_conflict(vllm_config: VllmConfig, ascend_config) -> str | None:
+    """Name the Ascend scheduling mode that already owns the scheduler, if any.
+
+    Each of these either claims ``scheduler_cls`` itself or relies on the
+    default ``BalanceScheduler`` (whose ``__init__`` installs the
+    short-request-first queue and whose ``schedule`` fork does the balancing),
+    so the replay scheduler cannot be combined with them yet.
+    """
+    scheduler_config = ascend_config.scheduler_config
+    if scheduler_config.recompute_scheduler_enable:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if getattr(kv_transfer_config, "kv_role", None) == "kv_consumer":
+            return "recompute_scheduler_enable"
+    if scheduler_config.dyntra_lb_config.enabled:
+        return "dyntra_lb_config"
+    if scheduler_config.profiling_chunk_config.enabled:
+        return "profiling_chunk_config"
+    if scheduler_config.batch_job_sched_config.enabled:
+        return "batch_job_sched_config"
+    if scheduler_config.short_request_first_config.enabled:
+        return "short_request_first_config"
+    if scheduler_config.enable_balance_scheduling:
+        return "enable_balance_scheduling"
+    return None
+
+
+def _apply_swa_bounded_replay(
+    vllm_config: VllmConfig,
+    ascend_config,
+) -> None:
+    """Select the replay-aware scheduler, or turn the switch off (S13).
+
+    SWA bounded replay needs a scheduler that rewinds a prefix hit. It is only
+    declared by the DeepSeek-V4 model wiring, and the replay scheduler behaves
+    exactly like the upstream one when no KV cache group declares a replay
+    window, so a switch that no model consumes is harmless.
+
+    Every unsupported combination is downgraded with a warning rather than
+    rejected, because the switch defaults to on: the model wiring then leaves
+    the sliding-window group prefix-cacheable, which is the behavior from
+    before this feature. The fix is written back into ``additional_config`` so
+    that worker processes, which re-create ``AscendConfig``, agree.
+    """
+    cache_config = vllm_config.cache_config
+    if cache_config is None or not getattr(cache_config, "swa_bounded_replay", False):
+        return
+
+    additional_config = vllm_config.additional_config
+    if additional_config is None:
+        vllm_config.additional_config = {}
+        additional_config = vllm_config.additional_config
+
+    def downgrade(reason: str) -> None:
+        cache_config.swa_bounded_replay = False
+        additional_config["swa_bounded_replay"] = False
+        logger.warning_once(f"SWA bounded replay is disabled: {reason}")
+
+    if vllm_version_is("0.28.0"):
+        downgrade("the release lane predates the scheduler hooks it is built on.")
+        return
+
+    model_config = vllm_config.model_config
+    if getattr(getattr(model_config, "hf_config", None), "model_type", None) != "deepseek_v4":
+        # Not a misuse: the switch only ever applies to the DeepSeek-V4 SWA
+        # group, and every other model leaves it unread.
+        logger.debug_once("SWA bounded replay is enabled but the model is not DeepSeek-V4; it has no effect.")
+        return
+
+    # DCP/PCP replicate or shard the KV cache, which changes what the replayed
+    # range has to cover; the two are mutually exclusive for now.
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.decode_context_parallel_size > 1 or parallel_config.prefill_context_parallel_size > 1:
+        downgrade("it is not supported together with DCP/PCP yet.")
+        return
+
+    conflict = _swa_bounded_replay_scheduler_conflict(vllm_config, ascend_config)
+    if conflict is not None:
+        downgrade(f"it is not supported together with {conflict} yet.")
+        return
+
+    vllm_config.scheduler_config.scheduler_cls = _get_swa_replay_scheduler_cls(
+        async_scheduling=vllm_config.scheduler_config.async_scheduling
+    )
+
 
 def _validate_sfa_dcp_kv_sp(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
@@ -1493,6 +1581,12 @@ def _get_dyntra_lb_scheduler_cls(*, async_scheduling: bool) -> str:
     if async_scheduling:
         return "vllm_ascend.core.dyntra_lb_scheduler.AsyncDyntraLBScheduler"
     return "vllm_ascend.core.dyntra_lb_scheduler.DyntraLBScheduler"
+
+
+def _get_swa_replay_scheduler_cls(*, async_scheduling: bool) -> str:
+    if async_scheduling:
+        return "vllm_ascend.core.swa_replay_scheduler.AsyncSwaReplayScheduler"
+    return "vllm_ascend.core.swa_replay_scheduler.SwaReplayScheduler"
 
 
 def _validate_parallel_config(vllm_config: VllmConfig) -> None:
