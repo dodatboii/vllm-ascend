@@ -294,6 +294,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
 
+    # [SWA-REPLAY S7] Per-request replay start: 0 for every request that is
+    # not replaying, else where that request's replayed run begins. The
+    # attention backends clamp a replayed request's sliding-window lower bound
+    # to it, so the window that is being rebuilt never reaches back into the
+    # stale compressed state of the prefix it is replaying over.
+    replay_start: torch.Tensor | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -348,6 +355,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             group_len=self.group_len,
             group_key_idx=self.group_key_idx,
             group_key_cache_idx=self.group_key_cache_idx,
+            replay_start=_slice_reqs(self.replay_start),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )

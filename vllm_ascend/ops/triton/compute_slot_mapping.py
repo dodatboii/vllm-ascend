@@ -8,7 +8,7 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens", "replay_window"])
 def _compute_slot_mapping_kernel(
     num_tokens,
     max_num_tokens,
@@ -18,6 +18,8 @@ def _compute_slot_mapping_kernel(
     block_table_stride,  # max_num_blocks_per_req
     block_size,  # Logical block size used by the attention kernel
     slot_mapping_ptr,  # [max_num_tokens], int32
+    replay_start_ptr,  # [max_num_reqs], int32; 0 = this req does not replay
+    replay_window,  # The one window every replaying group agrees on
     KV_CACHE_BLOCK_SIZE: tl.constexpr,  # Physical KV cache allocation block size
     BLOCKS_PER_KV_BLOCK: tl.constexpr,  # KV_CACHE_BLOCK_SIZE = BLOCKS_PER_KV_BLOCK * block_size
     TOTAL_CP_WORLD_SIZE: tl.constexpr,
@@ -26,6 +28,8 @@ def _compute_slot_mapping_kernel(
     PAD_ID: tl.constexpr,
     TILE_BLOCK_SIZE: tl.constexpr,
     BLOCK_TABLE_WINDOW_SIZE: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
+    IS_PREFIX_CACHEABLE: tl.constexpr,
     IS_CIRCULAR: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
@@ -43,6 +47,18 @@ def _compute_slot_mapping_kernel(
 
     start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+
+    # [SWA-REPLAY S6] A replayed request reuses its prefix hit's blocks, which
+    # are still shared with every other request that hit the same prefix: their
+    # KV must not be written again. The request recomputes
+    # [replay_start, replay_start + window) and past that the KV is new, so a
+    # cacheable group pads every position below the write start. The group that
+    # owns the replay (IS_PREFIX_CACHEABLE=False) writes them normally -- that
+    # write is what rebuilds its sliding window.
+    replay_start = 0
+    if HAS_REPLAY:
+        if IS_PREFIX_CACHEABLE:
+            replay_start = tl.load(replay_start_ptr + req_idx)
 
     row_offset = req_idx * block_table_stride
     block_table_offsets = tl.arange(0, BLOCK_TABLE_WINDOW_SIZE)
@@ -87,6 +103,11 @@ def _compute_slot_mapping_kernel(
             slot_ids = tl.where(pos >= 0, slot_ids, PAD_ID)
         if TOTAL_CP_WORLD_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        # [SWA-REPLAY S6] Last, so it wins over every other rule. Guarding on
+        # replay_start (not on the sum) is what keeps a non-replaying request,
+        # whose replay_start is 0, from padding its first window of tokens.
+        if replay_start > 0:
+            slot_ids = tl.where(pos < replay_start + replay_window, PAD_ID, slot_ids)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
 
@@ -109,7 +130,18 @@ def _compute_slot_mapping_request(
     PAD_ID: tl.constexpr,
     TILE_BLOCK_SIZE: tl.constexpr,
     BLOCK_TABLE_WINDOW_SIZE: tl.constexpr,
+    replay_start_ptr,
+    replay_window,
+    is_prefix_cacheable,
+    HAS_REPLAY: tl.constexpr,
 ):
+    # [SWA-REPLAY S6] See _compute_slot_mapping_kernel: only a cacheable group
+    # pads the replayed positions, and only for a request that replays.
+    replay_start = 0
+    if HAS_REPLAY:
+        if is_prefix_cacheable != 0:
+            replay_start = tl.load(replay_start_ptr + req_idx)
+
     row_offset = req_idx * block_table_stride
     block_table_offsets = tl.arange(0, BLOCK_TABLE_WINDOW_SIZE)
     for i in range(start_idx, end_idx, TILE_BLOCK_SIZE):
@@ -149,10 +181,15 @@ def _compute_slot_mapping_request(
         slot_ids = tl.where(is_circular & (pos < 0), PAD_ID, slot_ids)
         if TOTAL_CP_WORLD_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        # [SWA-REPLAY S6] Last, so it wins over every other rule. Guarding on
+        # replay_start (not on the sum) is what keeps a non-replaying request,
+        # whose replay_start is 0, from padding its first window of tokens.
+        if replay_start > 0:
+            slot_ids = tl.where(pos < replay_start + replay_window, PAD_ID, slot_ids)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
 
-@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens", "replay_window"])
 def _compute_slot_mapping_fused_groups_kernel(
     num_tokens,
     max_num_tokens,
@@ -163,7 +200,11 @@ def _compute_slot_mapping_fused_groups_kernel(
     block_table_strides_ptr,
     block_sizes_ptr,
     is_circular_ptr,
+    is_prefix_cacheable_ptr,
+    replay_start_ptr,
+    replay_window,
     HAS_CIRCULAR: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
     PAD_ID: tl.constexpr,
     NUM_REQS: tl.constexpr,
     TILE_BLOCK_SIZE: tl.constexpr,
@@ -197,6 +238,12 @@ def _compute_slot_mapping_fused_groups_kernel(
     block_table_stride = tl.load(block_table_strides_ptr + group_idx)
     block_size = tl.load(block_sizes_ptr + group_idx)
     is_circular = tl.load(is_circular_ptr + group_idx) if HAS_CIRCULAR else False
+    # [SWA-REPLAY S6] See _compute_slot_mapping_kernel: only a cacheable group
+    # pads the replayed positions, and only for a request that replays.
+    replay_start = 0
+    if HAS_REPLAY:
+        if tl.load(is_prefix_cacheable_ptr + group_idx) != 0:
+            replay_start = tl.load(replay_start_ptr + req_idx)
     row_offset = req_idx * block_table_stride
     block_table_offsets = tl.arange(0, BLOCK_TABLE_WINDOW_SIZE)
     for i in range(
@@ -223,10 +270,15 @@ def _compute_slot_mapping_fused_groups_kernel(
         block_numbers = tl.gather(block_table_window, relative_block_indices, 0).to(tl.int32)
         slot_ids = block_numbers * block_size + slot_offsets
         slot_ids = tl.where(is_circular & (pos < 0), PAD_ID, slot_ids)
+        # [SWA-REPLAY S6] Last, so it wins over every other rule. Guarding on
+        # replay_start (not on the sum) is what keeps a non-replaying request,
+        # whose replay_start is 0, from padding its first window of tokens.
+        if replay_start > 0:
+            slot_ids = tl.where(pos < replay_start + replay_window, PAD_ID, slot_ids)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
 
-@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens", "replay_window"])
 def _compute_slot_mapping_fused_groups_adaptive_kernel(
     num_tokens,
     max_num_tokens,
@@ -237,7 +289,11 @@ def _compute_slot_mapping_fused_groups_adaptive_kernel(
     block_table_strides_ptr,
     block_sizes_ptr,
     is_circular_ptr,
+    is_prefix_cacheable_ptr,
+    replay_start_ptr,
+    replay_window,
     HAS_CIRCULAR: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
     PAD_ID: tl.constexpr,
     NUM_REQS: tl.constexpr,
     SMALL_TILE_BLOCK_SIZE: tl.constexpr,
@@ -270,6 +326,9 @@ def _compute_slot_mapping_fused_groups_adaptive_kernel(
     block_table_stride = tl.load(block_table_strides_ptr + group_idx)
     block_size = tl.load(block_sizes_ptr + group_idx)
     is_circular = tl.load(is_circular_ptr + group_idx) if HAS_CIRCULAR else False
+    is_prefix_cacheable = 0
+    if HAS_REPLAY:
+        is_prefix_cacheable = tl.load(is_prefix_cacheable_ptr + group_idx)
     request_tokens = end_idx - start_idx
     if request_tokens <= SMALL_TILE_BLOCK_SIZE:
         _compute_slot_mapping_request(
@@ -290,6 +349,10 @@ def _compute_slot_mapping_fused_groups_adaptive_kernel(
             PAD_ID,
             SMALL_TILE_BLOCK_SIZE,
             SMALL_BLOCK_TABLE_WINDOW_SIZE,
+            replay_start_ptr,
+            replay_window,
+            is_prefix_cacheable,
+            HAS_REPLAY,
         )
     else:
         _compute_slot_mapping_request(
@@ -310,6 +373,10 @@ def _compute_slot_mapping_fused_groups_adaptive_kernel(
             PAD_ID,
             1024,
             LARGE_BLOCK_TABLE_WINDOW_SIZE,
+            replay_start_ptr,
+            replay_window,
+            is_prefix_cacheable,
+            HAS_REPLAY,
         )
 
 
@@ -352,7 +419,20 @@ def compute_slot_mapping_fused_groups(
     *,
     pad_id,
     is_circular_ptr=None,
+    is_prefix_cacheable_ptr=None,
+    replay_start_ptr=None,
+    has_replay=False,
+    replay_window=0,
 ):
+    # [SWA-REPLAY S6] Replay needs the per-group cacheability and the
+    # per-request write start together; either one alone cannot express the
+    # rule. ``has_replay`` is passed separately from the pointers because a
+    # launch argument is marshalled even into a folded-away branch, so the
+    # pointers are always real tensors and only the flag says whether the
+    # kernels may read them.
+    assert not has_replay or (is_prefix_cacheable_ptr is not None and replay_start_ptr is not None), (
+        "has_replay needs both is_prefix_cacheable_ptr and replay_start_ptr"
+    )
     tile_block_size, parallel_tiles = _select_slot_mapping_launch_config(num_reqs, num_tokens)
     block_table_window_size = _next_power_of_2((tile_block_size + min_block_size - 1) // min_block_size + 1)
     if num_reqs > 1 and tile_block_size < 1024:
@@ -366,7 +446,11 @@ def compute_slot_mapping_fused_groups(
             block_table_strides_ptr,
             block_sizes_ptr,
             is_circular_ptr,
+            is_prefix_cacheable_ptr,
+            replay_start_ptr,
+            replay_window,
             HAS_CIRCULAR=is_circular_ptr is not None,
+            HAS_REPLAY=has_replay,
             PAD_ID=pad_id,
             NUM_REQS=num_reqs,
             SMALL_TILE_BLOCK_SIZE=tile_block_size,
@@ -385,7 +469,11 @@ def compute_slot_mapping_fused_groups(
             block_table_strides_ptr,
             block_sizes_ptr,
             is_circular_ptr,
+            is_prefix_cacheable_ptr,
+            replay_start_ptr,
+            replay_window,
             HAS_CIRCULAR=is_circular_ptr is not None,
+            HAS_REPLAY=has_replay,
             PAD_ID=pad_id,
             NUM_REQS=num_reqs,
             TILE_BLOCK_SIZE=tile_block_size,

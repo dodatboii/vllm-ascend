@@ -37,11 +37,11 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_prefix_replay_tokens,
     is_prefix_cacheable,
+    resolve_replay_window,
 )
 from vllm_ascend.core.swa_replay_scheduler import (
     AsyncSwaReplayScheduler,
     SwaReplayScheduler,
-    _resolve_replay_window,
 )
 
 BLOCK_SIZE = 16
@@ -436,11 +436,11 @@ def test_get_prefix_replay_tokens_resolves_the_uniform_wrapper():
 
 
 def test_resolve_replay_window_agrees_across_groups():
-    assert _resolve_replay_window(_kv_cache_config()) == WINDOW
-    assert _resolve_replay_window(_kv_cache_config(uniform_swa_group=True)) == WINDOW
+    assert resolve_replay_window(_kv_cache_config()) == WINDOW
+    assert resolve_replay_window(_kv_cache_config(uniform_swa_group=True)) == WINDOW
     # No group replays: not a replay run at all.
     assert (
-        _resolve_replay_window(
+        resolve_replay_window(
             KVCacheConfig(
                 num_blocks=1,
                 kv_cache_tensors=[],
@@ -455,7 +455,7 @@ def test_resolve_replay_window_rejects_disagreeing_windows():
     """One rewind has to match every group's allocation, so the windows must
     agree."""
     with pytest.raises(AssertionError, match="should agree"):
-        _resolve_replay_window(
+        resolve_replay_window(
             KVCacheConfig(
                 num_blocks=1,
                 kv_cache_tensors=[],

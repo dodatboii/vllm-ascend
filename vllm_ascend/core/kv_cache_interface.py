@@ -12,6 +12,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -77,6 +78,24 @@ def get_prefix_replay_tokens(kv_cache_spec: KVCacheSpec) -> int:
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         return max(get_prefix_replay_tokens(spec) for spec in kv_cache_spec.kv_cache_specs.values())
     return getattr(kv_cache_spec, "prefix_replay_tokens", 0)
+
+
+def resolve_replay_window(kv_cache_config: KVCacheConfig) -> int:
+    """The replay window every replaying KV cache group agrees on, 0 when none.
+
+    All bounded-replay groups must share one window: a single rewind is applied
+    to every group's computed count, so groups that replay different amounts of
+    the same hit could not be rewound consistently. The scheduler asserts the
+    same agreement, and the worker reads the one agreed window to derive where
+    a replayed request's cached KV has to stop being written.
+    """
+    replay_windows = {
+        window
+        for group in kv_cache_config.kv_cache_groups
+        if (window := get_prefix_replay_tokens(group.kv_cache_spec)) > 0
+    }
+    assert len(replay_windows) <= 1, f"Prefix replay windows should agree: {sorted(replay_windows)}"
+    return replay_windows.pop() if replay_windows else 0
 
 
 def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:

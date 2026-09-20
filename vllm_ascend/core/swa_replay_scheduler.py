@@ -55,24 +55,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_ascend.core.kv_cache_interface import get_prefix_replay_tokens
-
-
-def _resolve_replay_window(kv_cache_config: KVCacheConfig) -> int:
-    """The agreed replay window across the KV cache groups, 0 when none replays.
-
-    All replayed groups share one window so a single rewind matches every
-    group's allocation; upstream asserts the same agreement.
-    """
-    replay_windows = {
-        window
-        for group in kv_cache_config.kv_cache_groups
-        if (window := get_prefix_replay_tokens(group.kv_cache_spec)) > 0
-    }
-    assert len(replay_windows) <= 1, (
-        f"Prefix replay windows should agree: {sorted(replay_windows)}"
-    )
-    return replay_windows.pop() if replay_windows else 0
+from vllm_ascend.core.kv_cache_interface import resolve_replay_window
 
 
 class SwaReplayScheduler(Scheduler):
@@ -84,7 +67,7 @@ class SwaReplayScheduler(Scheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.prefix_replay_tokens = _resolve_replay_window(self.kv_cache_config)
+        self.prefix_replay_tokens = resolve_replay_window(self.kv_cache_config)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

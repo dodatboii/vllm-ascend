@@ -263,6 +263,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     get_storage_block_size,
     requires_padded_page_layout,
+    resolve_replay_window,
 )
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -723,6 +724,15 @@ class NPUModelRunner(GPUModelRunner):
                 )
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+        # [SWA-REPLAY S6] The agreed replay window across the KV cache groups;
+        # initialize_kv_cache fills it in once the groups are known. 0 means
+        # nothing replays, and the whole replay path costs nothing.
+        self.prefix_replay_tokens = 0
+        # Per-request replay start: 0 for every request that is not replaying,
+        # else where that request's replayed run begins. Shares the same
+        # CPU->device rhythm as num_computed_tokens -- filled on the CPU as part
+        # of the step, then a pinned copy -- so it adds no new sync point.
+        self.replay_start = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1211,6 +1221,43 @@ class NPUModelRunner(GPUModelRunner):
 
         self.maybe_save_ec_to_connector({mm_hash: output}, mm_hash)
 
+    def _fill_replay_start(self, scheduler_output: "SchedulerOutput", num_reqs: int) -> torch.Tensor | None:
+        """[SWA-REPLAY S6/S7] Per-request replay start for a step that replays.
+
+        The value is the scheduler's, passed through unchanged: it is both the
+        lower bound the attention backends clamp a replayed request's sliding
+        window to, and -- together with the window -- the point the cacheable
+        groups stop writing KV at. A replayed request recomputes
+        ``[replay_start, replay_start + window)`` and past that the KV is new,
+        so the cacheable groups pad everything below it: that KV already exists
+        and is shared with every other request that hit the same prefix.
+
+        Returns None, having done nothing, on every step that does not replay,
+        so a run with the feature off pays nothing here.
+        """
+        if not self.prefix_replay_tokens:
+            return None
+        # `replay_start` only exists on the payloads while the replay patch is
+        # active, so read it defensively rather than assuming the field.
+        replay_starts = [
+            (req.req_id, getattr(req, "replay_start", 0)) for req in scheduler_output.scheduled_new_reqs
+        ]
+        replay_starts += list(getattr(scheduler_output.scheduled_cached_reqs, "replay_start", {}).items())
+        replay_starts = [(req_id, start) for req_id, start in replay_starts if start]
+        if not replay_starts:
+            return None
+
+        self.replay_start.np.fill(0)
+        req_id_to_index = self.input_batch.req_id_to_index
+        for req_id, start in replay_starts:
+            index = req_id_to_index.get(req_id)
+            if index is not None and index < num_reqs:
+                self.replay_start.np[index] = start
+        # Copy the whole buffer, not just num_reqs: a padded (graph) row must
+        # not pick up a write start left over from an earlier step.
+        self.replay_start.copy_to_gpu()
+        return self.replay_start.gpu
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1561,6 +1608,8 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
+            self._fill_replay_start(scheduler_output, num_reqs),
+            self.prefix_replay_tokens,
         )
 
         if self.use_async_spec_decode and (self.uses_mrope or (vllm_version_is("0.28.0") and self.uses_xdrope_dim > 0)):
@@ -3465,6 +3514,8 @@ class NPUModelRunner(GPUModelRunner):
             group_len = self.group_len.gpu[:num_reqs_padded],
             group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
             group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
+            # [SWA-REPLAY S7] 0 for every request that is not replaying.
+            replay_start=self.replay_start.gpu[:num_reqs_padded],
             req_ids_tensor=(
                 self._offload_req_ids_tensor.gpu[:num_reqs_padded]
                 if self._offload_req_ids_tensor is not None
@@ -4282,6 +4333,9 @@ class NPUModelRunner(GPUModelRunner):
         self.need_accepted_tokens = kv_cache_config.has_mamba_layers
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        # [SWA-REPLAY S6] Computed after the group list is final, because the
+        # calls above can still add or rewrap KV cache groups.
+        self.prefix_replay_tokens = resolve_replay_window(kv_cache_config)
         if self.sparse_kv_offload_enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,

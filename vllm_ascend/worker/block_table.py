@@ -10,7 +10,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import (
+    is_circular_kv_cache_spec,
+    is_prefix_cacheable,
+)
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
     _compute_slot_mapping_kernel,
@@ -50,6 +53,13 @@ class BlockTable:
         self.physical_block_size = block_size
         self.is_mamba_group = is_mamba_group
         self.is_circular = kv_cache_group is not None and is_circular_kv_cache_spec(kv_cache_group.kv_cache_spec)
+        # [SWA-REPLAY S6] Fixed at construction: a bounded-replay sliding-window
+        # group opts out of prefix caching, so it is the one group that has to
+        # keep writing the replayed positions -- everyone else must pad them.
+        self.is_prefix_cacheable = kv_cache_group is None or is_prefix_cacheable(kv_cache_group.kv_cache_spec)
+        # Stand-in for the per-request replay start when nothing replays, so the
+        # kernel always gets a real pointer to marshal (it is never read then).
+        self._no_replay_start = torch.zeros(1, dtype=torch.int32, device=device)
         if self.is_circular:
             if self.dcp_world_size != 1:
                 raise ValueError("Circular tail caches do not support context parallelism.")
@@ -152,7 +162,13 @@ class BlockTable:
         num_reqs: int,
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
+        replay_start: torch.Tensor | None = None,
+        replay_window: int = 0,
     ) -> None:
+        """[SWA-REPLAY S6] ``replay_start`` is a per-request int32 tensor that
+        is 0 for every request that is not replaying, else where that request's
+        replayed run begins (see ``_mark_prefix_replay``); ``replay_window`` is
+        the one window every replaying group agrees on."""
         num_tokens = positions.shape[0]
         total_cp_world_size = self.dcp_world_size
         total_cp_rank = self.dcp_rank
@@ -162,7 +178,7 @@ class BlockTable:
                 query_start_loc[1:] - query_start_loc[:-1],
                 output_size=num_tokens,
             )
-            self._compute_dcp_slot_mapping(req_indices, positions)
+            self._compute_dcp_slot_mapping(req_indices, positions, replay_start, replay_window)
         else:
             TILE_BLOCK_SIZE = 1024
             kernel_kwargs = {
@@ -186,6 +202,13 @@ class BlockTable:
                 self.block_table.gpu.stride(0),
                 self.block_size,
                 self.slot_mapping.gpu,
+                self._no_replay_start if replay_start is None else replay_start,
+                replay_window,
+                HAS_REPLAY=replay_start is not None,
+                # When nothing replays the group's cacheability cannot matter,
+                # so pin it and keep one compiled variant per group instead of
+                # one per distinct cacheability.
+                IS_PREFIX_CACHEABLE=(self.is_prefix_cacheable if replay_start is not None else True),
                 **kernel_kwargs,
             )
 
@@ -245,6 +268,8 @@ class BlockTable:
         self,
         req_indices: torch.Tensor,
         positions: torch.Tensor,
+        replay_start: torch.Tensor | None = None,
+        replay_window: int = 0,
     ) -> None:
         # Note(hc): The DCP implement store kvcache with an interleave
         # style, the kvcache for the token whose token_idx is i is
@@ -279,14 +304,25 @@ class BlockTable:
 
         block_offsets = local_physical_offsets % self.block_size
 
+        # [SWA-REPLAY S6] A replayed request's prefix hit is shared with every
+        # other request that hit it, so a cacheable group must not write the
+        # replayed positions [replay_start, replay_start + window). The owning
+        # (non-cacheable) group writes them normally to rebuild its window.
+        # Only the non-draft path can replay, so the per-request tensor is
+        # always on the same device as the indices here.
+        keep = mask
+        if replay_start is not None and self.is_prefix_cacheable:
+            start = replay_start[req_indices]
+            keep = keep & ~((start > 0) & (positions < start + replay_window))
+
         if block_table_indices.device.type != "cpu":
             block_numbers = self.block_table.gpu.flatten()[block_table_indices]
             slot_mapping = block_numbers * self.block_size + block_offsets
-            self.slot_mapping.gpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
+            self.slot_mapping.gpu[: req_indices.shape[0]] = torch.where(keep, slot_mapping, -1)
         else:
             block_numbers = self.block_table.cpu.flatten()[block_table_indices]
             slot_mapping = block_numbers * self.block_size + block_offsets
-            self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
+            self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(keep, slot_mapping, -1)
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
@@ -439,7 +475,15 @@ class MultiGroupBlockTable:
                 dtype=torch.int32,
                 device=device,
             )
+            self._fused_is_prefix_cacheable = torch.tensor(
+                [block_table.is_prefix_cacheable for block_table in active_block_tables],
+                dtype=torch.int32,
+                device=device,
+            )
             self._fused_min_block_size = min(block_table.block_size for block_table in active_block_tables)
+        # [SWA-REPLAY S6] Stand-in pointer for the per-request replay start when
+        # nothing replays, so every kernel launch gets a real tensor to marshal.
+        self._no_replay_start = torch.zeros(1, dtype=torch.int32, device=device)
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -468,6 +512,8 @@ class MultiGroupBlockTable:
         positions: torch.Tensor,
         positions_compressed_list: list[np.ndarray] | None = None,
         req_indices_compressed_list: list[np.ndarray] | None = None,
+        replay_start: torch.Tensor | None = None,
+        replay_window: int = 0,
     ) -> None:
         num_tokens = positions.shape[0]
         if self._can_fuse_slot_mapping and not positions_compressed_list and not req_indices_compressed_list:
@@ -485,6 +531,10 @@ class MultiGroupBlockTable:
                 self._fused_min_block_size,
                 pad_id=PAD_SLOT_ID,
                 is_circular_ptr=self._fused_is_circular,
+                is_prefix_cacheable_ptr=self._fused_is_prefix_cacheable,
+                replay_start_ptr=(self._no_replay_start if replay_start is None else replay_start),
+                has_replay=replay_start is not None,
+                replay_window=replay_window,
             )
             return
 
@@ -494,7 +544,7 @@ class MultiGroupBlockTable:
             if positions_compressed_list and req_indices_compressed_list:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
-                block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+                block_table.compute_slot_mapping(num_reqs, query_start_loc, positions, replay_start, replay_window)
 
     def compute_slot_mapping_draft(
         self,
